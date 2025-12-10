@@ -1,0 +1,466 @@
+---
+title: "Projekt Zaliczeniowy"
+author: "Łukasz Walicki 151061"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: yeti
+    df_print: paged
+---
+
+# Streszczenie
+
+Celem niniejszego raportu jest analiza czynników wpływających na pojemność superkondensatorów oraz budowa modelu predykcyjnego opartego na danych z 925 wierszy. Zbiór danych poddano czyszczeniu, usunięto zbędne zmienne tekstowe, zakodowano konfigurację ogniwa oraz uzupełniono liczne braki, aby umożliwić dalszą analizę. W części eksploracyjnej zbadano rozkłady wartości, zależności między atrybutami oraz występowanie braków, co pozwoliło lepiej zrozumieć strukturę danych. Przeprowadzono analizę korelacji oraz wizualizacje ilustrujące główne trendy dotyczące m.in. gęstości prądu, powierzchni właściwej i składu materiałowego. Następnie wykonano analizę skupień w celu identyfikacji grup materiałów o podobnych właściwościach oraz zbudowano model predykcyjny metodą Random Forest, oceniając jego skuteczność i najważniejsze cechy wpływające na wynik.
+
+# Wylistowanie bibliotek oraz ustawienie seeda
+
+```{r imports, message=FALSE, warning=FALSE}
+library(ggcorrplot)
+library(tidyr) 
+library(readr)
+library(dplyr)
+library(ggtern)
+library(ggplot2)
+library(janitor)
+library(plotly)
+library(caret)
+library(factoextra)  
+library(fpc)         
+library(NbClust)     
+library(viridis)
+print("Liczba używanych bibliotek:")
+length(sessionInfo()$otherPkgs)
+
+
+
+
+
+set.seed(1234)
+```
+
+# Wczytanie i przygotowanie danych
+
+```{r }
+raw_data <- read_csv("data.csv")
+
+glimpse(raw_data)
+head(raw_data)
+
+```
+
+## Czyszczenie nazw kolumn
+
+```{r}
+data <- raw_data %>%
+clean_names()
+
+
+names(data)
+
+```
+
+Nazwy kolumn są porządkowane do postaci snake_case, co ułatwia późniejszą pracę z danymi.
+
+## Usunięcie danych niepotrzebnych i label encoding
+
+```{r}
+char_cols <- names(data)[sapply(data, is.character)]
+char_cols_keep <- "cell_configuration_three_two_electrode_system"
+
+data <- data %>%
+select(-all_of(setdiff(char_cols, char_cols_keep)))
+
+data <- data %>%
+mutate(
+cell_configuration_three_two_electrode_system_encoded =
+as.numeric(as.factor(cell_configuration_three_two_electrode_system))
+)
+
+data <- data%>%select(-cell_configuration_three_two_electrode_system,-potential_window_v)
+```
+
+W tej części usunięto z danych wszystkie zmienne tekstowe poza informacją o konfiguracji ogniwa, ponieważ pozostałe kolumny znakowe nie wnosiły wartości do dalszej analizy. Następnie dokonano kodowania etykietowego konfiguracji ogniwa ze względu na tylko dwa systemy elekrod. Dodatkowo usunięto zmienną potential_window_v, aby uniknąć redundancji, ponieważ jest to różnica między Lower Limit of Potential Window (V) oraz Upper Limit of Potential Window (V).
+
+## Ilość pustych wartości dla każdej kolumny
+
+```{r}
+
+
+missing_tbl <- sapply(data, function(x) sum(is.na(x))) %>%
+sort(decreasing = TRUE)
+
+missing_tbl
+
+```
+
+```{r}
+missing_df <- tibble(
+variable = names(missing_tbl),
+missing = as.numeric(missing_tbl)
+)
+
+ggplot(missing_df, aes(x = reorder(variable, missing), y = missing)) +
+geom_col(fill = "steelblue") +
+coord_flip() +
+labs(
+x = "Zmienna",
+y = "Liczba brakujących wartości",
+title = "Brakujące dane w zbiorze"
+)
+
+```
+
+Wykres braków danych pokazuje wyraźnie, że największe ubytki dotyczą parametrów związanych z opornością oraz strukturą porowatości materiałów. Brakuje przede wszystkim informacji o oporze transferu ładunku (Rct), szeregowym oporze wewnętrznym (Rs), rozmiarze porów i objętości porów. Dane dotyczące składu pierwiastkowego (N, C, O) również pojawiają się w sposób niepełny, co ogranicza możliwości pełnej analizy chemicznej.
+
+## Zastąpienie pustych wartości zerami
+
+```{r}
+data[data == ""] <- NA
+data <- data %>% mutate(across(everything(), ~replace_na(., 0)))
+```
+
+Wszystkie brakujące wartości zostały zastąpione zerami, aby umożliwić dalszą obróbkę danych i uniknąć problemów podczas analiz. Przyjęto założenie, że jeśli dana wartość nie została podana, to można traktować ją jako równą zero. Warto jednak podkreślić, że w wielu kolumnach braków było bardzo dużo, co pokazuje, że zbiór danych nie został przygotowany w sposób kompletny i może wymagać ostrożności przy interpretacji wyników.
+
+# Podsumowanie danych
+
+```{r}
+
+
+summary(data)
+
+```
+
+# Prezentacja rozkładów wartości
+
+```{r, message=FALSE, warning=FALSE}
+
+for (col in names(data)) {
+  
+  p_hist <- ggplot(data, aes_string(x = col)) +
+    geom_density(fill = "steelblue", color = "white") +
+    theme_minimal() +
+    labs(
+      title = paste("Gęstość wartości dla :", col),
+      x = col,
+      y = "Liczność"
+    )
+  
+  print(p_hist)
+}
+
+```
+
+Rozkłady wartości pokazują dużą zmienność danych oraz liczne braki w wielu zmiennych, co utrudnia jednoznaczną interpretację wyników. Wiele parametrów ma rozkład silnie skośny — większość obserwacji skupia się na niskich wartościach, a wysokie pojawiają się rzadko. Dla analityka oznacza to konieczność ostrożnego podejścia do dalszych analiz, ponieważ niepełność i nierównomierne rozłożenie danych mogą wpływać na wiarygodność wniosków i modeli predykcyjnych.
+
+# Korelacja
+
+```{r}
+corr_vars <- data 
+
+
+
+
+
+corr_matrix <- cor(corr_vars)
+corr_matrix
+
+```
+
+```{r fig.width=12, fig.height=10}
+
+ggcorrplot(
+  corr_matrix,
+  method = "square",
+  type = "lower",
+  lab = TRUE,
+  lab_size = 3.5,
+  tl.cex = 10,
+  tl.srt = 45,
+  colors = c("blue", "white", "red"),
+  outline.color = "gray30",
+  title = "Macierz korelacji"
+)
+
+
+```
+
+Macierz korelacji wskazuje, że zależności liniowe między zmiennymi są stosunkowo słabe. Jednym z niewielu wyraźniejszych związków jest dodatnia korelacja między oporem transferu ładunku a szeregowym oporem wewnętrznym. Zmienna pojemność nie wykazuje jednak silnej zależności z żadną pojedynczą cechą, co sugeruje, że jej wartość wynika raczej z kombinacji wielu czynników niż z jednego dominującego parametru.
+
+# Analiza trendów
+
+```{r}
+
+
+p_trend <- ggplot(
+  data,
+  aes(
+    x = specific_surface_area_m_2_g,
+    y = current_density_a_g,
+    color = capacitance_f_g
+  )
+) +
+  geom_point(alpha = 0.8, size = 3) +
+  scale_color_viridis(option = "A") +
+  theme_minimal() +
+  labs(
+    title = "Wpływ SSA i gęstości prądu na pojemność",
+    x = "Specific surface area (m²/g)",
+    y = "Current density (A/g)",
+    color = "Capacitance (F/g)"
+  )
+
+ggplotly(p_trend)
+
+
+```
+
+Wykres zależności między powierzchnią właściwą a gęstością prądu, z kolorystycznym oznaczeniem pojemności, ujawnia, że najwyższe pojemności uzyskiwane są głównie przy niskich gęstościach prądu. Pojemność silnie spada, gdy gęstość prądu rośnie, niezależnie od wartości SSA.
+
+```{r}
+data_tern <- data %>% 
+  select(n_at_percent, o_at_percent, c_at_percent) %>% 
+  na.omit()
+
+p_tern_plotly <- plot_ly(
+  data = data_tern,
+  a = ~c_at_percent,
+  b = ~n_at_percent,
+  c = ~o_at_percent,
+  type = "scatterternary",
+  mode = "markers",
+  marker = list(size = 6, opacity = 0.7, color = "steelblue")
+) %>% 
+  layout(
+    title = list(
+      text = "Wykres ternarny: proporcje tlenu, azotu i węgla w materiałach",
+      y = 1.08  
+    ),
+    ternary = list(
+      aaxis = list(title = "C (at. %)"),
+      baxis = list(title = "N (at. %)"),
+      caxis = list(title = "O (at. %)")
+    ),
+    margin = list(t = 100)  
+  )
+
+
+p_tern_plotly
+```
+
+Wykres ternarny pokazujący proporcje N–C–O pozwala dostrzec, że większość analizowanych materiałów ma bardzo wysoką zawartość węgla. Zawartość azotu jest zwykle niska, a tlen występuje w zróżnicowanych ilościach, bez wyraźnej tendencji.
+
+```{r}
+p_cd_cap <- ggplot(
+  data,
+  aes(
+    x = current_density_a_g,
+    y = capacitance_f_g,
+    color = electrolyte_concentration_m
+  )
+) +
+  geom_point(size = 3, alpha = 0.7) +
+  scale_color_viridis(option = "C") +
+  theme_minimal() +
+  labs(
+    title = "Zależność: gęstość prądu i pojemność",
+    x = "Current density (A/g)",
+    y = "Capacitance (F/g)",
+    color = "Electrolyte conc. (M)"
+  )
+
+ggplotly(p_cd_cap)
+
+```
+
+Wykres pokazuje, że pojemność silnie zależy od gęstości prądu: najwyższe wartości uzyskiwane są przy bardzo niskich obciążeniach, natomiast przy wyższych gęstościach prądu pojemność wyraźnie spada. Stężenie elektrolitu nie wykazuje jednoznacznego wpływu na wyniki.
+
+# Analiza skupień
+
+## Przygotowanie danych do klasteryzacji
+
+```{r}
+
+cluster_vars <- data
+
+
+preproc_cluster <- preProcess(
+cluster_vars,
+method = c("medianImpute", "center", "scale")
+)
+
+cluster_scaled <- predict(preproc_cluster, cluster_vars)
+
+
+
+```
+
+## Dobór optymalnej liczby klastrów
+
+```{r}
+
+nb <- NbClust(
+data = cluster_scaled,
+distance = "euclidean",
+min.nc = 2,
+max.nc = 6,
+method = "kmeans",
+index = "all"
+)
+
+nb$Best.nc
+
+```
+
+## Klasteryzacja metodą k-means
+
+```{r}
+
+k_opt <- 5  
+
+km_res <- kmeans(cluster_scaled, centers = k_opt, nstart = 25)
+
+
+
+data_clustered <- data %>%
+filter(rowSums(is.na(cluster_vars)) < ncol(cluster_vars)) %>%
+mutate(cluster = factor(km_res$cluster))
+
+
+```
+
+## Wizualizacja klastrów
+
+```{r}
+fviz_cluster(
+km_res,
+data = cluster_scaled,
+geom = "point",
+ellipse.type = "norm",
+main = "Klastry materiałów (k-means)"
+)
+
+```
+
+```{r}
+ggplot(data_clustered, aes(x = cluster, y = capacitance_f_g, fill = cluster)) +
+geom_boxplot() +
+labs(
+x = "Klaster",
+y = "Capacitance (F/g)",
+title = "Pojemność właściwa w klastrach"
+)
+
+```
+
+W analizie skupień dane zostały najpierw przygotowane poprzez imputację braków i standaryzację zmiennych, aby wszystkie cechy miały porównywalny wpływ na algorytm. Następnie, z wykorzystaniem pakietu NbClust, porównano wiele różnych kryteriów oceny jakości podziału i na tej podstawie wybrano optymalną liczbę klastrów. Większość indeksów wskazała, że najbardziej sensowny podział to pięć grup.
+
+Zastosowanie metody k-means pozwoliło na wyodrębnienie pięciu odmiennych klastrów materiałów, różniących się parametrami strukturalnymi i elektrochemicznymi. Wizualizacja klastrów pokazała, że grupy te zajmują różne obszary przestrzeni cech, co oznacza, że algorytm wychwycił realne różnice między próbkami. Analiza pojemności w klastrach ujawniła, że niektóre grupy charakteryzują się wyraźnie wyższą pojemnością właściwą niż pozostałe, co może sugerować, że łączą one materiały o korzystnych parametrach i warunkach testowych.
+
+# Budowa i walidacja modelu predykcyjnego metodą random forest
+
+## Przygotowanie danych do modelowania
+
+```{r}
+ml_data <- data
+
+outer_idx <- createDataPartition(ml_data$capacitance_f_g, p = 0.7, list = FALSE)
+
+train_outer <- ml_data[outer_idx, ]
+test_outer <- ml_data[-outer_idx, ]
+```
+
+## Trenowanie modelu
+
+```{r}
+ctrl_inner <- trainControl(method = "cv", number = 5)
+
+
+rf_model <- train(
+capacitance_f_g ~ .,
+data = train_outer,
+method = "rf",
+trControl = ctrl_inner,
+preProcess = c("center", "scale"),
+importance = TRUE
+)
+
+rf_model
+```
+
+## Ocena jakości modelu na zbiorze testowym
+
+```{r}
+pred <- predict(rf_model, test_outer)
+postResample(pred, test_outer$capacitance_f_g)
+```
+
+## Ważność cech
+
+```{r}
+varImp(rf_model)
+plot(varImp(rf_model), main = "Ważność cech w modelu Random Forest")
+```
+
+```{r message=FALSE, warning=FALSE}
+
+
+pred <- predict(rf_model, test_outer)
+
+results_df <- data.frame(
+  Actual = test_outer$capacitance_f_g,
+  Predicted = pred
+)
+
+
+
+ggplot(results_df, aes(x = Actual, y = Predicted)) +
+  geom_point(color = "steelblue", alpha = 0.7, size = 3) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", size = 1) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Wartości rzeczywiste vs przewidywane",
+    subtitle = "Model Random Forest (ocena na zbiorze testowym)",
+    x = "Pojemność rzeczywista (F/g)",
+    y = "Pojemność przewidywana (F/g)"
+  )
+
+```
+
+## Wyliczenie błędów predykcji
+
+```{r}
+
+pred <- predict(rf_model, test_outer)
+
+
+MAE <- mean(abs(test_outer$capacitance_f_g - pred))
+
+
+mean_capacitance <- mean(test_outer$capacitance_f_g, na.rm = TRUE)
+
+
+error_percentage <- (MAE / mean_capacitance) * 100
+
+cat("Średni błąd bezwzględny (MAE):", round(MAE, 2), "F/g\n")
+cat("Średnia pojemność w zbiorze testowym:", round(mean_capacitance, 2), "F/g\n")
+cat("Średni błąd procentowy modelu:", round(error_percentage, 2), "%\n")
+
+```
+
+Model Random Forest został wytrenowany na danych podzielonych na część treningową i testową, z wykorzystaniem walidacji krzyżowej. Na zbiorze testowym uzyskał średni błąd około 137 F/g, co odpowiada ok. 33,5% średniej pojemności — oznacza to umiarkowaną dokładność predykcji. Analiza ważności cech pokazała, że największy wpływ na wyniki mają parametry związane z oknem potencjału, stężenie i przewodnictwo elektrolitu oraz gęstość prądu, natomiast cechy materiałowe odgrywają mniejszą rolę. Wyniki potwierdzają, że pojemność zależy głównie od warunków testowych, a duża niejednorodność danych ogranicza precyzję modelu.
+
+# Wnioski
+
+-   Zbiór danych jest niejednorodny i zawiera wiele braków.
+
+-   Zależności liniowe między zmiennymi są słabe.
+
+-   Klasteryzacja ujawniła 5 wyraźnych grup materiałów, z których niektóre charakteryzują się wyższą pojemnością niż pozostałe.
+
+-   Model Random Forest przewiduje pojemność ze średnim błędem ok. 33%, co wskazuje na umiarkowaną dokładność przy dużej zmienności danych.
+
+-   Najważniejszymi cechami w modelu okazały się parametry związane z oknem potencjału, stężeniem i przewodnictwem elektrolitu oraz gęstością prądu.
